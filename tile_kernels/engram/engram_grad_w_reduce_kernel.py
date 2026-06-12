@@ -1,5 +1,4 @@
 import os
-
 import torch
 import tilelang
 from tilelang import language as T
@@ -21,8 +20,7 @@ def get_engram_grad_w_reduce_kernel(
     blk_d = 512
     assert hidden_size % blk_d == 0
     num_tiles = hidden_size // blk_d
-    num_batches = 4
-    assert num_persistent_blocks % num_batches == 0
+    num_batches = max(batch for batch in range(4, 0, -1) if num_persistent_blocks % batch == 0)
     num_rows = num_persistent_blocks // num_batches
 
     @T.prim_func
