@@ -68,14 +68,22 @@ def pytest_configure(config):
     if worker_id is not None:
         gpu_id = int(worker_id.replace('gw', ''))
         num_gpus = torch.cuda.device_count()
-        os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id % num_gpus)
+        pinned_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
+        if not pinned_visible_devices:
+            os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id % num_gpus)
+        if os.environ.get('TK_TILELANG_CACHE_PER_WORKER') == '1':
+            cache_dir = os.environ.get('TILELANG_CACHE_DIR')
+            if cache_dir:
+                worker_cache_dir = os.path.join(cache_dir, worker_id)
+                os.makedirs(worker_cache_dir, exist_ok=True)
+                os.environ['TILELANG_CACHE_DIR'] = worker_cache_dir
 
         # Restrict each worker's GPU memory to (total - 10 GB) / workers_per_gpu.
         # PYTEST_XDIST_WORKER_COUNT is set by pytest-xdist automatically.
         total_workers = int(os.environ.get('PYTEST_XDIST_WORKER_COUNT', '1'))
         workers_per_gpu = math.ceil(total_workers / num_gpus)
         _reserve_bytes = 10 * (1024 ** 3)  # 10 GB reserved for system / frameworks
-        total_mem = torch.cuda.mem_get_info(0)[1]
+        total_mem = torch.cuda.get_device_properties(0).total_memory
         usable_mem = max(total_mem - _reserve_bytes, 0)
         mem_per_worker = usable_mem / workers_per_gpu
         fraction = mem_per_worker / total_mem
@@ -101,6 +109,40 @@ def pytest_collection_modifyitems(config, items):
     # With --run-benchmark, benchmark tests run alongside correctness tests
     # (e.g. `pytest kernel.py --run-benchmark`).
     # Use `-m benchmark` explicitly if you want ONLY benchmarks.
+
+
+@pytest.fixture(autouse=True)
+def _sync_after_benchmark(request):
+    yield
+    if (
+        os.environ.get('TK_BENCHMARK_SYNC_AFTER_TEST') == '1'
+        and 'benchmark' in request.node.keywords
+        and torch.cuda.is_available()
+    ):
+        torch.cuda.synchronize()
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    report = outcome.get_result()
+    worker_id = os.environ.get('PYTEST_XDIST_WORKER', 'main')
+    trace_prefix = os.environ.get('TK_BENCHMARK_TRACE_REPORT')
+    if trace_prefix and report.when == 'call':
+        trace_path = f'{trace_prefix}.{worker_id}.log'
+        with open(trace_path, 'a') as f:
+            f.write(f'{report.outcome}: {report.nodeid}\n')
+
+    output_prefix = os.environ.get('TK_BENCHMARK_FAILURE_REPORT')
+    if not output_prefix or report.when != 'call' or not report.failed:
+        return
+
+    output_path = f'{output_prefix}.{worker_id}.log'
+    with open(output_path, 'a') as f:
+        f.write(f'nodeid: {report.nodeid}\n')
+        f.write(f'worker: {worker_id}\n')
+        f.write(str(report.longrepr))
+        f.write('\n\n')
 
 
 
@@ -159,7 +201,8 @@ def pytest_sessionfinish(session, exitstatus):
     results, baselines, regressions, improvements, missing = result
     # Stash for pytest_terminal_summary
     session.config._benchmark_detection = result
-    if (regressions or missing) and exitstatus == 0:
+    allow_missing = os.environ.get('TK_BENCHMARK_ALLOW_MISSING_BASELINES') == '1'
+    if (regressions or (missing and not allow_missing)) and exitstatus == 0:
         session.exitstatus = 1
 
 
@@ -421,7 +464,6 @@ def benchmark_record(request):
         with request.config._benchmark_results_lock:
             request.config._benchmark_results.append(record)
 
-
     return _record
 
 
@@ -440,7 +482,8 @@ def benchmark_timer():
     from tilelang.profiler.bench import do_bench
 
     def _timer(fn, **overrides):
-        kwargs = dict(backend='cupti', warmup=0, rep=30)
+        backend = os.environ.get('TK_BENCHMARK_BACKEND', 'cupti')
+        kwargs = dict(backend=backend, warmup=0, rep=30)
         kwargs.update(overrides)
         return do_bench(fn, **kwargs) * 1e3  # ms → us
 
@@ -473,5 +516,3 @@ def _load_baselines():
             rec = json.loads(line)
             baselines[_make_key(rec)] = rec
     return baselines
-
-

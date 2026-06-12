@@ -18,3 +18,7 @@ _version.py
 
 # workspace
 workspace
+
+.venv-*
+.test-logs
+analysis

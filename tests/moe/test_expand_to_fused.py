@@ -85,6 +85,8 @@ def generate_test_data_expand_to_fused_with_sf(params):
         round_sf=round_sf,
         use_packed_ue8m0=use_packed_ue8m0,
     )
+    if os.environ.get('TK_SYNC_AFTER_EXPAND_WITH_SF_CAST') == '1':
+        torch.cuda.synchronize()
     pos_to_expert, _, _, token_topk_to_pos, _, _, _, _ = tile_kernels.moe.get_fused_mapping(topk_idx, num_experts, 0, 16)
 
     return (x_fp8, x_sf, pos_to_expert, token_topk_to_pos, num_tokens)
